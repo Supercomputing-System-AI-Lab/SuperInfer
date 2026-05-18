@@ -1,10 +1,10 @@
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from vllm.logger import init_logger
 from vllm.utils import cdiv
 from vllm.v1.core.kv_cache_utils import (BlockHashType, FreeKVCacheBlockQueue,
-                                         KVCacheBlock,
+                                         KVCacheBlock, KVCacheBlockStatus,
                                          generate_block_hash_extra_keys,
                                          hash_block_tokens,
                                          hash_request_tokens)
@@ -14,22 +14,29 @@ logger = init_logger(__name__)
 
 
 class KVCacheManager:
+    """SuperInfer KV-cache manager with paired GPU + CPU block pools."""
 
     def __init__(
         self,
         block_size: int,
         num_gpu_blocks: int,
+        num_cpu_blocks: int,
         max_model_len: int,
         sliding_window: Optional[int] = None,
         enable_caching: bool = True,
         num_preallocate_tokens: int = 64,
+        prefix_cache_fix: bool = True,
     ) -> None:
         self.block_size = block_size
         self.num_gpu_blocks = num_gpu_blocks
+        self.num_cpu_blocks = num_cpu_blocks
         self.max_model_len = max_model_len
         self.max_num_blocks_per_req = cdiv(max_model_len, block_size)
         self.sliding_window = sliding_window
         self.enable_caching = enable_caching
+        # Workaround for a prefix-caching invalidation bug — see SuperInfer
+        # paper §A; toggle off via ``--no-prefix-cache-fix`` for ablation.
+        self.fix_wrong_prefix_caching = prefix_cache_fix
         # NOTE(woosuk): To avoid frequent block allocation, we preallocate some
         # blocks for each request. For example, when a request reaches the end
         # of its block table, we preallocate N blocks in advance. This way, we
@@ -47,10 +54,20 @@ class KVCacheManager:
         self.block_pool: List[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
+        self.block_pool_cpu: List[KVCacheBlock] = [
+            KVCacheBlock(idx) for idx in range(num_cpu_blocks)
+        ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.block_pool)
+        self.free_block_queue_cpu = FreeKVCacheBlockQueue(self.block_pool_cpu)
+
+        for block in self.block_pool:
+            block.mark_free()
+            # NOTE(julian): permanently mapped CPU block for each GPU block
+            # this will simplify the swapping management
+            block.mapped_cpu_block = self.free_block_queue_cpu.popleft()
 
         # {block_hash: {block ID: block}}. A cached block is
         # a full block with a block hash that can be used for prefix caching.
@@ -68,7 +85,23 @@ class KVCacheManager:
         # for each request, so that we can free the blocks when the request
         # is finished.
         self.req_to_blocks: Dict[str, List[KVCacheBlock]] = {}
+        self.req_to_blocks_cpu: Dict[str, List[KVCacheBlock]] = {}
 
+        # NOTE(julian): pending blocks to be swapped
+        self.pending_blocks_to_swap_out: List[Tuple[int, int]] = []
+        self.pending_blocks_to_swap_in: List[Tuple[int, int]] = []
+
+    def get_and_reset_pending_blocks_to_swap_in(self) -> List[Tuple[int, int]]:
+        ret = self.pending_blocks_to_swap_in
+        self.pending_blocks_to_swap_in = []
+        return ret
+
+    def get_and_reset_pending_blocks_to_swap_out(self) -> List[Tuple[int, int]]:
+        ret = self.pending_blocks_to_swap_out
+        self.pending_blocks_to_swap_out = []
+        return ret
+
+    # NOTE(julian): find prefix caching only for new requests
     def get_computed_blocks(self, request: Request) -> List[KVCacheBlock]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -102,6 +135,12 @@ class KVCacheManager:
                 break
 
         return computed_blocks
+
+    def get_append_slots_num_new_blocks(self, request: Request, num_tokens: int) -> int:
+        num_required_blocks = cdiv(request.num_computed_tokens + num_tokens, self.block_size)
+        req_blocks = self.req_to_blocks[request.request_id]
+        num_new_blocks = num_required_blocks - len(req_blocks)
+        return max(num_new_blocks, 0)
 
     def append_slots(
         self,
@@ -154,36 +193,72 @@ class KVCacheManager:
         if not self.enable_caching:
             return new_blocks
 
-        num_computed_full_blocks = (request.num_computed_tokens //
-                                    self.block_size)
+        if self.fix_wrong_prefix_caching:
 
-        # NOTE(rickyx): We are assuming the `num_tokens` are actual
-        # tokens rather than lookahead slots (e.g. for speculative decoding).
-        # TODO(rickyx): When supporting speculative decoding, we will need to
-        # differentiate between them so that we can know how many blocks are
-        # full after appending the actual tokens.
-        num_full_blocks_after_append = (request.num_computed_tokens +
-                                        num_tokens) // self.block_size
-        assert num_full_blocks_after_append <= len(req_blocks)
+            num_cached_full_blocks = request.num_cached_tokens // self.block_size
+            num_computed_full_blocks = request.num_computed_tokens // self.block_size
 
-        new_full_blocks = req_blocks[
-            num_computed_full_blocks:num_full_blocks_after_append]
-        if new_full_blocks:
-            self._cache_full_blocks(
-                request=request,
-                blk_start_idx=num_computed_full_blocks,
-                full_blocks=new_full_blocks,
-                prev_block=req_blocks[num_computed_full_blocks - 1]
-                if num_computed_full_blocks >= 1 else None,
-            )
+            new_full_blocks = req_blocks[num_cached_full_blocks:num_computed_full_blocks]
+
+            if new_full_blocks:
+                self._cache_full_blocks(
+                    request=request,
+                    blk_start_idx=num_cached_full_blocks,
+                    full_blocks=new_full_blocks,
+                    prev_block=req_blocks[num_cached_full_blocks - 1]
+                    if num_cached_full_blocks >= 1 else None,
+                )
+                request.num_cached_tokens = num_computed_full_blocks * self.block_size
+
+            for block in new_full_blocks:
+                block.mark_full(clean=True)
+                self.pending_blocks_to_swap_out.append((block.block_id, block.mapped_cpu_block.block_id))
+            for block in req_blocks[num_computed_full_blocks:num_required_blocks]:
+                block.mark_half(dirty=True)
+
+        else:
+
+            num_computed_full_blocks = (request.num_computed_tokens //
+                                        self.block_size)
+
+            # NOTE(rickyx): We are assuming the `num_tokens` are actual
+            # tokens rather than lookahead slots (e.g. for speculative decoding).
+            # TODO(rickyx): When supporting speculative decoding, we will need to
+            # differentiate between them so that we can know how many blocks are
+            # full after appending the actual tokens.
+            num_full_blocks_after_append = (request.num_computed_tokens +
+                                            num_tokens) // self.block_size
+            assert num_full_blocks_after_append <= len(req_blocks)
+
+            new_full_blocks = req_blocks[
+                num_computed_full_blocks:num_full_blocks_after_append]
+            if new_full_blocks:
+                self._cache_full_blocks(
+                    request=request,
+                    blk_start_idx=num_computed_full_blocks,
+                    full_blocks=new_full_blocks,
+                    prev_block=req_blocks[num_computed_full_blocks - 1]
+                    if num_computed_full_blocks >= 1 else None,
+                )
 
         return new_blocks
+
+    def get_allocated_slots_num_new_blocks(self, request: Request, num_tokens: int, computed_blocks: List[KVCacheBlock]) -> int:
+        if num_tokens == 0:
+            return 0
+        num_required_blocks = cdiv(num_tokens, self.block_size)
+        num_new_blocks = min(
+            num_required_blocks,
+            self.max_num_blocks_per_req - len(computed_blocks),
+        )
+        return num_new_blocks
 
     def allocate_slots(
         self,
         request: Request,
         num_tokens: int,
         computed_blocks: List[KVCacheBlock],
+        no_preallocate: bool = False,
     ) -> Optional[List[KVCacheBlock]]:
         """Allocate slots for a new request.
 
@@ -209,14 +284,15 @@ class KVCacheManager:
                 "prefix caching is disabled")
 
         num_required_blocks = cdiv(num_tokens, self.block_size)
-        if (num_required_blocks > self.free_block_queue.num_free_blocks):
+        nb = self.free_block_queue.num_free_blocks
+        if (num_required_blocks > nb):
             # Cannot allocate new blocks.
             return None
 
         # Determine the number of new blocks to allocate considering
         # preallocated blocks.
         num_new_blocks = min(
-            num_required_blocks + self.num_preallocate_blocks,
+            num_required_blocks + (0 if no_preallocate else self.num_preallocate_blocks),
             self.free_block_queue.num_free_blocks,
             # Should not exceed the maximum number of blocks per request.
             # This is especially because the block table has the shape
@@ -234,23 +310,32 @@ class KVCacheManager:
         if not self.enable_caching:
             return new_blocks
 
-        num_computed_tokens = len(computed_blocks) * self.block_size
-        num_full_blocks = (num_computed_tokens + num_tokens) // self.block_size
+        if self.fix_wrong_prefix_caching:
 
-        new_full_blocks = self.req_to_blocks[
-            request.request_id][len(computed_blocks):num_full_blocks]
-        if new_full_blocks:
-            self._cache_full_blocks(
-                request=request,
-                blk_start_idx=len(computed_blocks),
-                # The new full blocks are the full blocks that are not computed.
-                full_blocks=new_full_blocks,
-                prev_block=computed_blocks[-1] if computed_blocks else None,
-            )
+            request.num_cached_tokens = len(computed_blocks) * self.block_size
+
+            for i in range(num_required_blocks):
+                new_blocks[i].mark_half(dirty=True)
+
+        else:
+
+            num_computed_tokens = len(computed_blocks) * self.block_size
+            num_full_blocks = (num_computed_tokens + num_tokens) // self.block_size
+
+            new_full_blocks = self.req_to_blocks[
+                request.request_id][len(computed_blocks):num_full_blocks]
+            if new_full_blocks:
+                self._cache_full_blocks(
+                    request=request,
+                    blk_start_idx=len(computed_blocks),
+                    # The new full blocks are the full blocks that are not computed.
+                    full_blocks=new_full_blocks,
+                    prev_block=computed_blocks[-1] if computed_blocks else None,
+                )
 
         return new_blocks
 
-    def free(self, request: Request) -> None:
+    def free(self, request: Request, keep_cpu: bool = False, swapped: bool = False) -> None:
         """Free the blocks allocated for the request.
         When caching is enabled, we free the blocks in reverse order so that
         the tail blocks are evicted first.
@@ -267,10 +352,71 @@ class KVCacheManager:
             ordered_blocks = reversed(blocks)
 
         for block in ordered_blocks:
-            block.decr_ref()
+            block.decr_ref(keep_cpu=keep_cpu)
             if block.ref_cnt == 0:
+                block.mark_free()
                 self.free_block_queue.append(block)
+            elif swapped:
+                block.mark_clean()
 
+    def get_swap_in_num_new_blocks(self, request: Request, computed_blocks: List[KVCacheBlock]) -> int:
+        cpu_blocks = self.req_to_blocks_cpu[request.request_id]
+        num_new_tokens = (len(cpu_blocks) - len(computed_blocks)) * self.block_size
+        num_new_blocks = self.get_allocated_slots_num_new_blocks(request, num_new_tokens, computed_blocks)
+        return num_new_blocks
+
+    def swap_in(self, request: Request, computed_blocks: List[KVCacheBlock]) -> Optional[List[KVCacheBlock]]:
+        cpu_blocks = self.req_to_blocks_cpu[request.request_id]
+        num_new_tokens = (len(cpu_blocks) - len(computed_blocks)) * self.block_size
+        new_blocks = self.allocate_slots(request, num_new_tokens, computed_blocks, no_preallocate=True)
+
+        if new_blocks is None:
+            return None
+
+        # NOTE(julian): free useless swapping blocks
+        for cpu_block in cpu_blocks[:len(computed_blocks)]:
+            cpu_block.decr_ref()
+            if cpu_block.ref_cnt == 0:
+                self.free_block_queue_cpu.append(cpu_block)
+
+        # NOTE(julian): relocate the mapping
+        for gpu_block, cpu_block in zip(new_blocks, cpu_blocks[len(computed_blocks):]):
+            assert gpu_block.mapped_cpu_block is not None
+            gpu_block.mapped_cpu_block.decr_ref()
+            if gpu_block.mapped_cpu_block.ref_cnt == 0:
+                self.free_block_queue_cpu.append(gpu_block.mapped_cpu_block)
+            gpu_block.mapped_cpu_block = cpu_block
+
+        # NOTE(julian): restore block status
+        for i, block in enumerate(new_blocks):
+            blk_idx = len(computed_blocks) + i
+            if blk_idx * self.block_size + 1 <= request.num_computed_tokens:
+                if (blk_idx + 1) * self.block_size <= request.num_computed_tokens:
+                    block.mark_full(clean=True)
+                else:
+                    block.mark_half(dirty=True)
+                self.pending_blocks_to_swap_in.append((block.mapped_cpu_block.block_id, block.block_id))
+            else:
+                block.mark_empty()
+
+        self.req_to_blocks_cpu.pop(request.request_id)
+
+        return new_blocks
+
+    def swap_out(self, request: Request) -> None:
+        start = self.free_block_queue.num_free_blocks
+        gpu_blocks = self.req_to_blocks[request.request_id]
+        cpu_blocks = [b.mapped_cpu_block for b in gpu_blocks]
+
+        # NOTE(julian): get blocks to swap out
+        self.pending_blocks_to_swap_out.extend([(b.block_id, b.mapped_cpu_block.block_id) \
+            for b in gpu_blocks if b.is_dirty()])
+        # NOTE(julian): free gpu blocks
+        self.free(request, keep_cpu=True, swapped=True)
+
+        self.req_to_blocks_cpu[request.request_id] = cpu_blocks # type: ignore
+        return self.free_block_queue.num_free_blocks - start
+    
     def _get_new_blocks(self, num_blocks: int) -> List[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -291,7 +437,13 @@ class KVCacheManager:
         while idx < num_blocks:
             # First allocate blocks.
             curr_block = self.free_block_queue.popleft()
+            curr_block.mark_empty()
             assert curr_block.ref_cnt == 0
+
+            # NOTE(julian): COW: if the mapped cpu block is refed, allocated a new one
+            assert curr_block.mapped_cpu_block is not None
+            if curr_block.mapped_cpu_block.ref_cnt > 0:
+                curr_block.mapped_cpu_block = self.free_block_queue_cpu.popleft()
 
             # If the block is cached, evict it.
             if self.enable_caching:
@@ -349,6 +501,7 @@ class KVCacheManager:
             # candidate), so remove it.
             if block.ref_cnt == 0:
                 self.free_block_queue.remove(block)
+                block.mark_full(clean=True)
             block.incr_ref()
 
     def _cache_full_blocks(
@@ -420,3 +573,34 @@ class KVCacheManager:
             blk.block_hash = block_hash
             self.cached_block_hash_to_block[block_hash][blk.block_id] = blk
             prev_block_hash_value = block_hash.hash_value
+
+    def can_hold_all_requests(self, running, waiting) -> bool:
+        num_free_blocks = self.free_block_queue.num_free_blocks
+        for request in running:
+            num_new_tokens = request.num_tokens - request.num_computed_tokens
+            num_new_blocks = self.get_append_slots_num_new_blocks(request, num_new_tokens)
+            num_free_blocks -= num_new_blocks
+            if num_free_blocks < 0:
+                return False
+        for request in waiting:
+            computed_blocks = self.get_computed_blocks(request)
+            num_new_tokens = request.num_tokens - len(computed_blocks) * self.block_size
+            num_new_blocks = self.get_allocated_slots_num_new_blocks(request, num_new_tokens, computed_blocks)
+            num_free_blocks -= num_new_blocks
+            if num_free_blocks < 0:
+                return False
+        return True
+
+    def get_num_blocks_to_free(self, request: Request):
+        blocks = self.req_to_blocks[request.request_id]
+        num = sum(b.ref_cnt == 1 for b in blocks)
+        return num
+
+    def get_num_free_blocks(self):
+        return self.free_block_queue.num_free_blocks
+
+    def get_kv_caches_usage(self) -> Tuple[float, float]:
+        gpu_usage = 1 - self.free_block_queue.num_free_blocks / len(self.block_pool)
+        cpu_usage = 1 - self.free_block_queue_cpu.num_free_blocks / len(self.block_pool_cpu)
+        return gpu_usage, cpu_usage
+

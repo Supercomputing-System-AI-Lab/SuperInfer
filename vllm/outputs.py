@@ -116,6 +116,8 @@ class RequestOutput:
         encoder_prompt: Optional[str] = None,
         encoder_prompt_token_ids: Optional[List[int]] = None,
         num_cached_tokens: Optional[int] = None,
+        observability: Optional[dict] = None,
+        time: Optional[float] = None,
         *,
         multi_modal_placeholders: Optional[MultiModalPlaceholderDict] = None,
     ) -> None:
@@ -131,6 +133,8 @@ class RequestOutput:
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
+        self.observability = observability
+        self.time = time
 
     @classmethod
     def new(

@@ -2,6 +2,7 @@ from collections import UserDict, defaultdict
 from typing import (Any, Dict, List, Literal, Mapping, Sequence, Tuple,
                     TypedDict, TypeVar, Union, cast, final)
 
+import msgspec
 import numpy as np
 import torch
 import torch.types

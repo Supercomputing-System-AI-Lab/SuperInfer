@@ -205,3 +205,18 @@ benchmarks/*.json
 # Linting
 actionlint
 shellcheck*/
+
+# Claude Code per-project settings
+/.claude/
+
+# SuperInfer artifact-evaluation outputs
+/ae_results/
+
+# SuperInfer experiment scratch (data dumps, plots) at repo root
+/tmp/
+/exp*.png
+/output.png
+
+# flashinfer is a runtime pip dependency (see requirements-cuda.txt);
+# do not commit if it ever lands in the working tree
+/flashinfer/

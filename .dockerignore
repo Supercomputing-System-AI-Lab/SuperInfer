@@ -3,6 +3,22 @@
 dist
 vllm/*.so
 
+# SuperInfer-specific scratch / artifacts
+/.deps
+/.git
+/.github
+/.history
+/.idea
+/.vscode
+/.claude
+/.buildkite
+/ae_results
+/tmp
+/exp*.png
+/output.png
+/*.so
+/__pycache__
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

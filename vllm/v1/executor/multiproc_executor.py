@@ -9,7 +9,11 @@ from enum import Enum, auto
 from multiprocessing.process import BaseProcess
 from typing import Any, Dict, List, Optional, Tuple
 
+import msgspec
+import torch
 import zmq
+import nvtx
+import torch.multiprocessing as mp
 
 from vllm.config import VllmConfig
 from vllm.distributed import (destroy_distributed_environment,
@@ -77,7 +81,7 @@ class MultiprocExecutor(Executor):
         for w in self.workers:
             w.worker_response_mq.wait_until_ready()
 
-    def initialize(self, num_gpu_blocks: int) -> None:
+    def initialize(self, num_gpu_blocks: int, num_cpu_blocks: int=0) -> None:
         """
         Initialize the KV caches and begin the model execution loop of the
         underlying workers.
@@ -385,3 +389,190 @@ class WorkerProc:
 
             self.worker_response_mq.enqueue(
                 (WorkerProc.ResponseStatus.SUCCESS, output))
+
+
+from vllm import _custom_ops as ops  # naive swapper
+
+_MODEL_EXEC_IPC = "ipc:///tmp/model-exec-input"
+
+
+class MultiprocExecutorProcess(Executor):
+    """Multi-GPU variant of :class:`UniprocExecutorProcess`.
+
+    Mirrors the single-GPU control plane: the model executor lives in a
+    child process and SuperInfer's swap thread is bootstrapped there.
+    The Python-side ZMQ sockets driving the C++ swap thread live here in
+    the engine-core process.
+    """
+
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        ctx = mp.get_context("spawn")
+        self._queue_in = ctx.Queue()
+        self._queues_out: Dict[str, mp.Queue] = {
+            "__init__": ctx.Queue(),
+            "determine_num_available_blocks": ctx.Queue(),
+            "initialize": ctx.Queue(),
+            "execute_model": ctx.Queue(),
+            "profile": ctx.Queue(),
+            "shutdown": ctx.Queue(),
+            "check_health": ctx.Queue(),
+            "init_swapper": ctx.Queue(),
+        }
+        self._inner_process = ctx.Process(
+            target=self._inner_process_fn,
+            args=(self._queue_in, self._queues_out, vllm_config,
+                  vllm_config.observability_config.collect_model_execute_time),
+        )
+        self._inner_process.start()
+        self._queues_out["__init__"].get()  # wait for child to come up
+
+        zmq_context = zmq.Context()
+        self.model_exec_socket = zmq_context.socket(zmq.PUSH)
+        self.model_exec_socket.connect(_MODEL_EXEC_IPC)
+
+        self._swap_data_socket = None
+        self._swap_notify_socket = None
+        self._swap_encoder = msgspec.msgpack.Encoder()
+
+    @staticmethod
+    def _inner_process_fn(
+        queue_in: mp.Queue,
+        queues_out: Dict[str, mp.Queue],
+        vllm_config: VllmConfig,
+        collect_model_execute_time: bool,
+    ):
+        from vllm.v1.swapper import Swapper
+
+        executor = MultiprocExecutor(vllm_config)
+
+        zmq_context = zmq.Context()
+        model_exec_socket = zmq_context.socket(zmq.PULL)
+        model_exec_socket.bind(_MODEL_EXEC_IPC)
+
+        queues_out["__init__"].put_nowait(None)
+
+        while True:
+            if model_exec_socket.poll(timeout=0) == zmq.POLLIN:
+                scheduler_output = model_exec_socket.recv_pyobj()
+                queues_out["execute_model"].put_nowait(
+                    executor.execute_model(scheduler_output))
+                continue
+
+            try:
+                fn_name, args = queue_in.get_nowait()
+            except Exception:
+                continue
+
+            if fn_name == "init_swapper":
+                num_cpu_blocks, = args
+                kv_cache_gpu = (
+                    executor.worker.model_runner.kv_caches_gpu_tensor)
+                cache_cfg = vllm_config.cache_config
+                Swapper(
+                    vllm_config,
+                    kv_cache_gpu,
+                    num_cpu_blocks,
+                    swap_block_first=cache_cfg.swap_block_first,
+                    pin_memory_fix=cache_cfg.pin_memory_fix,
+                )
+                queues_out["init_swapper"].put_nowait(None)
+                continue
+
+            fn = getattr(executor, fn_name)
+            result = fn(*args) if args is not None else fn()
+            queues_out[fn_name].put_nowait(result)
+
+    # --- Control RPCs -------------------------------------------------- #
+
+    def get_queue_in(self) -> mp.Queue:
+        return self._queue_in
+
+    def get_queue_out_execute_model(self) -> mp.Queue:
+        return self._queues_out["execute_model"]
+
+    def determine_num_available_blocks(self) -> Tuple[int, int]:
+        self._queue_in.put_nowait(("determine_num_available_blocks", None))
+        return self._queues_out["determine_num_available_blocks"].get()
+
+    def initialize(self,
+                   num_gpu_blocks: int,
+                   num_cpu_blocks: int = 0) -> None:
+        self._queue_in.put_nowait(
+            ("initialize", (num_gpu_blocks, num_cpu_blocks)))
+        return self._queues_out["initialize"].get()
+
+    def execute_model(self, scheduler_output) -> ModelRunnerOutput:
+        self._queue_in.put_nowait(("execute_model", (scheduler_output, )))
+        return self._queues_out["execute_model"].get()
+
+    def profile(self, is_start: bool = True):
+        self._queue_in.put_nowait(("profile", (is_start, )))
+        return self._queues_out["profile"].get()
+
+    def shutdown(self):
+        self._queue_in.put_nowait(("shutdown", None))
+        return self._queues_out["shutdown"].get()
+
+    def check_health(self) -> None:
+        self._queue_in.put_nowait(("check_health", None))
+        return self._queues_out["check_health"].get()
+
+    # --- Swap fast path ----------------------------------------------- #
+
+    def init_swapper(self, num_cpu_blocks: int):
+        from vllm.v1.swapper import (SWAPPER_DATA_PATH, SWAPPER_NOTIFY_PATH)
+
+        ctx = zmq.Context.instance()
+        self._swap_data_socket = ctx.socket(zmq.PUSH)
+        self._swap_notify_socket = ctx.socket(zmq.PULL)
+        self._swap_notify_socket.bind(SWAPPER_NOTIFY_PATH)
+
+        self._queue_in.put_nowait(("init_swapper", (num_cpu_blocks, )))
+
+        self._swap_data_socket.connect(SWAPPER_DATA_PATH)
+        return self._queues_out["init_swapper"].get()
+
+    @nvtx.annotate("MultiprocExecutorProcess.swap", color="blue")
+    def swap(
+        self,
+        in_mapping: List[Tuple[int, int]],
+        out_mapping: List[Tuple[int, int]],
+    ) -> float:
+        self.start_swap_async(in_mapping, out_mapping)
+        return self.wait_swap()
+
+    @nvtx.annotate("MultiprocExecutorProcess.start_swap_async", color="blue")
+    def start_swap_async(
+        self,
+        blocks_to_swap_in: List[Tuple[int, int]],
+        blocks_to_swap_out: List[Tuple[int, int]],
+    ) -> None:
+        payload = self._swap_encoder.encode(
+            [blocks_to_swap_in, blocks_to_swap_out])
+        self._swap_data_socket.send(payload, copy=False, flags=zmq.NOBLOCK)
+
+    @nvtx.annotate("MultiprocExecutorProcess.wait_swap", color="blue")
+    def wait_swap(self) -> float:
+        import struct
+        data = self._swap_notify_socket.recv()
+        swap_time_us, = struct.unpack("Q", data)
+        return swap_time_us / 1_000_000
+
+    @nvtx.annotate("MultiprocExecutorProcess.zmq_start_model_execute_async",
+                   color="orange")
+    def zmq_start_model_execute_async(self, scheduler_output):
+        import pickle
+        self.model_exec_socket.send_pyobj(
+            scheduler_output,
+            flags=zmq.NOBLOCK,
+            copy=False,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    @nvtx.annotate("UniprocExecutorProcess.zmq_start_model_execute_async", color="orange")
+    def zmq_start_model_execute_async(self, scheduler_output):
+        # print("[zmq] get model_exec time", time.perf_counter())
+        # data_serialized = self.model_exec_encoder.encode(scheduler_output)
+        # self.model_exec_socket.send(data_serialized, copy=False, flags=zmq.NOBLOCK)
+        self.model_exec_socket.send_pyobj(scheduler_output, flags=zmq.NOBLOCK, copy=False, protocol=pickle.HIGHEST_PROTOCOL)
+

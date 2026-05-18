@@ -136,3 +136,8 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
                  const torch::Tensor& block_mapping) {
   TORCH_CHECK(false, "swap_blocks is unsupported on CPU.")
 }
+
+void swap_blocks_new(torch::Tensor& kv_caches_gpu, torch::Tensor& kv_caches_cpu,
+  const torch::Tensor& blocks_to_swap_in, const torch::Tensor& blocks_to_swap_out) {
+  TORCH_CHECK(false, "swap_blocks_new is unsupported on CPU.")
+}

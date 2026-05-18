@@ -14,7 +14,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
-
+import time
 import vllm.envs as envs
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.attention.backends.abstract import AttentionState
@@ -1673,7 +1673,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     model_input,
                     kv_caches=kv_caches
                 )
-
+        
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
         seqlen_agnostic_kwargs = {
             "finished_requests_ids": model_input.finished_requests_ids,
@@ -1764,7 +1764,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             # the communication time as well.
             output.model_forward_time = (orig_model_forward_time +
                                          model_forward_time)
-
+        assert not self.return_hidden_states
         if self.return_hidden_states:
             # we only need to pass hidden states of most recent token
             assert model_input.sampling_metadata is not None
@@ -1779,7 +1779,6 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 hidden_states = hidden_or_intermediate_states
 
             output.hidden_states = hidden_states
-
         return [output]
 
     def need_recv_kv(self, model_input, kv_caches) -> bool:

@@ -31,10 +31,14 @@ install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 # Supported python versions.  These versions will be searched in order, the
 # first match will be selected.  These should be kept in sync with setup.py.
 #
-set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12")
+set(PYTHON_SUPPORTED_VERSIONS "3.9;3.12")
 
 # Supported NVIDIA architectures.
-set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0")
+# set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.7;8.9;9.0")
+
+# set(CUDA_SUPPORTED_ARCHS "8.0;8.6")
+# set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.7;8.9;9.0")
+set(CUDA_SUPPORTED_ARCHS "9.0")
 
 # Supported AMD GPU architectures.
 set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx1100;gfx1101")
@@ -253,7 +257,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   # Only build Marlin kernels if we are building for at least some compatible archs.
   # Keep building Marlin for 9.0 as there are some group sizes and shapes that
   # are not supported by Machete yet.
-  cuda_archs_loose_intersection(MARLIN_ARCHS "8.0;8.6;8.7;8.9;9.0" ${CUDA_ARCHS})
+  # cuda_archs_loose_intersection(MARLIN_ARCHS "8.0;8.6;8.7;8.9;9.0" ${CUDA_ARCHS})
+  # cuda_archs_loose_intersection(MARLIN_ARCHS "8.0;8.6" ${CUDA_ARCHS})
+  # cuda_archs_loose_intersection(MARLIN_ARCHS "8.0;8.6;8.7;8.9;9.0" ${CUDA_ARCHS})
+  cuda_archs_loose_intersection(MARLIN_ARCHS "9.0" ${CUDA_ARCHS})
   if (MARLIN_ARCHS)
     set(MARLIN_SRCS
        "csrc/quantization/fp8/fp8_marlin.cu"
@@ -275,7 +282,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 
   # The cutlass_scaled_mm kernels for Hopper (c3x, i.e. CUTLASS 3.x) require
   # CUDA 12.0 or later (and only work on Hopper, 9.0/9.0a for now).
-  cuda_archs_loose_intersection(SCALED_MM_3X_ARCHS "9.0;9.0a" "${CUDA_ARCHS}")
+  # cuda_archs_loose_intersection(SCALED_MM_3X_ARCHS "9.0;9.0a" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(SCALED_MM_3X_ARCHS "9.0" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0 AND SCALED_MM_3X_ARCHS)
     set(SRCS "csrc/quantization/cutlass_w8a8/scaled_mm_c3x.cu")
     set_gencode_flags_for_srcs(
@@ -303,8 +311,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   #
   # For the cutlass_scaled_mm kernels we want to build the c2x (CUTLASS 2.x)
   # kernels for the remaining archs that are not already built for 3x.
+  # cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
+  #   "8.0;8.6;8.7;8.9;9.0" "${CUDA_ARCHS}")
+  # cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
+  #   "8.0;8.6" "${CUDA_ARCHS}")
+  # cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
+  #  "8.0;8.6;8.7;8.9;9.0" "${CUDA_ARCHS}")
   cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
-    "7.5;8.0;8.6;8.7;8.9;9.0" "${CUDA_ARCHS}")
+    "9.0" "${CUDA_ARCHS}")
   # subtract out the archs that are already built for 3x
   list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
   if (SCALED_MM_2X_ARCHS)
@@ -356,7 +370,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 
   # The machete kernels only work on hopper and require CUDA 12.0 or later.
   # Only build Machete kernels if we are building for something compatible with sm90a
-  cuda_archs_loose_intersection(MACHETE_ARCHS "9.0a" "${CUDA_ARCHS}")
+  # cuda_archs_loose_intersection(MACHETE_ARCHS "9.0a" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(MACHETE_ARCHS "9.0" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0 AND MACHETE_ARCHS)
     #
     # For the Machete kernels we automatically generate sources for various
@@ -455,7 +470,10 @@ set_gencode_flags_for_srcs(
   CUDA_ARCHS "${CUDA_ARCHS}")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
-  cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0;8.6;8.7;8.9;9.0" "${CUDA_ARCHS}")
+  # cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0;8.6;8.7;8.9;9.0" "${CUDA_ARCHS}")
+  # cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0;8.6" "${CUDA_ARCHS}")
+  # cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "8.0;8.6;8.7;8.9;9.0" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(MARLIN_MOE_ARCHS "9.0" "${CUDA_ARCHS}")
   if (MARLIN_MOE_ARCHS)
     set(MARLIN_MOE_SRC
         "csrc/moe/marlin_kernels/marlin_moe_kernel.h"

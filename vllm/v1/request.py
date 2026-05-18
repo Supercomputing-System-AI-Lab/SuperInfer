@@ -1,4 +1,5 @@
 import enum
+import time
 from typing import TYPE_CHECKING, List, Optional, Union
 
 from vllm.inputs import DecoderOnlyInputs, SingletonInputsAdapter, token_inputs
@@ -12,6 +13,21 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHashType
 
+class RequestLookaheadContextManager:
+    def __init__(self, request: "Request", lookahead: bool) -> None:
+        self.request = request
+        self.lookahead = lookahead
+
+    def __enter__(self) -> None:
+        if self.lookahead:
+            self.request.lookahead = True
+            self.num_computed_tokens_original = self.request.num_computed_tokens
+            self.request.num_computed_tokens = self.request.num_computed_tokens_next
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self.lookahead:
+            self.request.lookahead = False
+            self.request.num_computed_tokens = self.num_computed_tokens_original
 
 class Request:
 
@@ -41,12 +57,22 @@ class Request:
         assert sampling_params.max_tokens is not None
         self.max_tokens = sampling_params.max_tokens
 
+        self.lookahead: bool = False
+
         self.prompt = self.inputs.prompt
         self.prompt_token_ids = self.inputs.prompt_token_ids
         self.num_prompt_tokens = len(self.prompt_token_ids)
         self._output_token_ids: List[int] = []
         self._all_token_ids: List[int] = self.prompt_token_ids.copy()
         self.num_computed_tokens = 0
+        # NOTE(julian): for prefix caching fixing
+        self.num_cached_tokens = 0
+        # NOTE(julian): for lookahead scheduling
+        self.num_tokens_next = self.num_tokens
+        self.num_computed_tokens_next = 0
+        # NOTE(julian): for proactive scheduling
+        self.in_running_since: Optional[float] = None
+        self.in_waiting_since: Optional[float] = arrival_time
 
         # Multi-modal input metadata.
         mm_positions = self.inputs.multi_modal_placeholders
@@ -108,7 +134,10 @@ class Request:
 
     @property
     def num_tokens(self) -> int:
-        return len(self._all_token_ids)
+        if self.lookahead:
+            return self.num_tokens_next
+        else:
+            return len(self._all_token_ids)
 
     @property
     def num_output_tokens(self) -> int:
@@ -143,22 +172,25 @@ class Request:
     def append_kv_block_hashes(self, block_hash: "BlockHashType") -> None:
         self._kv_block_hashes.append(block_hash)
 
+    def clear_kv_block_hashes(self) -> None:
+        self._kv_block_hashes.clear()
 
 class RequestStatus(enum.IntEnum):
     """Status of a request."""
     WAITING = 0
     RUNNING = 1
     PREEMPTED = 2
-    # Note: anything after PREEMPTED (2) will be considered
+    SWAPPED = 3
+    # Note: anything after SWAPPED (3) will be considered
     # as a finished status.
-    FINISHED_STOPPED = 3
-    FINISHED_LENGTH_CAPPED = 4
-    FINISHED_ABORTED = 5
-    FINISHED_IGNORED = 6
+    FINISHED_STOPPED = 4
+    FINISHED_LENGTH_CAPPED = 5
+    FINISHED_ABORTED = 6
+    FINISHED_IGNORED = 7
 
     @staticmethod
     def is_finished(status: "RequestStatus") -> bool:
-        return status > RequestStatus.PREEMPTED
+        return status > RequestStatus.SWAPPED
 
     @staticmethod
     def get_finished_reason(status: "RequestStatus") -> Union[str, None]:

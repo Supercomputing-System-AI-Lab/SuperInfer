@@ -102,6 +102,13 @@ class FlashAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by FlashAttention. "
                 f"Supported head sizes are: {support_head_sizes}.")
 
+        # The layout of ``kv_cache`` (block-first vs layer-first) is set
+        # by the model runner using ``cache_config.swap_block_first``. We
+        # mirror that choice here so the attention slicing matches.
+        from vllm.config import get_current_vllm_config
+        self.block_first = (
+            get_current_vllm_config().cache_config.swap_block_first)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -156,7 +163,10 @@ class FlashAttentionImpl(AttentionImpl):
         # not padded. However, we don't need to do key[:num_actual_tokens] and
         # value[:num_actual_tokens] because the reshape_and_cache_flash op uses
         # the slot_mapping's shape to determine the number of actual tokens.
-        key_cache, value_cache = kv_cache.unbind(0)
+        if self.block_first:
+            key_cache, value_cache = kv_cache.unbind(1)
+        else:
+            key_cache, value_cache = kv_cache.unbind(0)
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
             value,
@@ -167,7 +177,6 @@ class FlashAttentionImpl(AttentionImpl):
             k_scale,
             v_scale,
         )
-
         # Compute attention and update output up to `num_actual_tokens`.
         flash_attn_varlen_func(
             q=query[:num_actual_tokens],

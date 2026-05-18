@@ -1023,6 +1023,15 @@ def swap_blocks(src: torch.Tensor, dst: torch.Tensor,
     torch.ops._C_cache_ops.swap_blocks(src, dst, block_mapping)
 
 
+def swap_blocks_new(
+        kv_caches_gpu: torch.Tensor,
+        kv_caches_cpu: torch.Tensor,
+        blocks_to_swap_in: torch.Tensor,
+        blocks_to_swap_out: torch.Tensor,
+    ) -> None:
+    torch.ops._C_cache_ops.swap_blocks_new(kv_caches_gpu, kv_caches_cpu,
+                                           blocks_to_swap_in, blocks_to_swap_out)
+
 def convert_fp8(output: torch.Tensor,
                 input: torch.Tensor,
                 scale: float = 1.0,
