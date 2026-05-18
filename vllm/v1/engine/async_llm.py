@@ -1,3 +1,5 @@
+import time
+
 import asyncio
 from typing import AsyncGenerator, Dict, List, Mapping, Optional, Type, Union
 
@@ -105,7 +107,7 @@ class AsyncLLM(EngineClient):
             vllm_config = engine_config
 
         executor_class = cls._get_executor_cls(vllm_config)
-
+        
         # Create the AsyncLLM.
         return cls(
             vllm_config=vllm_config,
@@ -128,17 +130,18 @@ class AsyncLLM(EngineClient):
 
     @classmethod
     def _get_executor_cls(cls, vllm_config: VllmConfig) -> Type[Executor]:
-        executor_class: Type[Executor]
-        distributed_executor_backend = (
-            vllm_config.parallel_config.distributed_executor_backend)
-        if distributed_executor_backend == "mp":
-            from vllm.v1.executor.multiproc_executor import MultiprocExecutor
-            executor_class = MultiprocExecutor
-        else:
-            assert (distributed_executor_backend is None)
-            from vllm.v1.executor.uniproc_executor import UniprocExecutor
-            executor_class = UniprocExecutor
-        return executor_class
+        # SuperInfer always co-locates the model executor with the C++ swap
+        # thread in a separate process, so we use the ``*Process`` variants
+        # regardless of distributed backend selection.
+        backend = vllm_config.parallel_config.distributed_executor_backend
+        if backend == "mp":
+            from vllm.v1.executor.multiproc_executor import (
+                MultiprocExecutorProcess)
+            return MultiprocExecutorProcess
+        assert backend is None, (
+            f"Unsupported distributed_executor_backend: {backend!r}")
+        from vllm.v1.executor.uniproc_executor import UniprocExecutorProcess
+        return UniprocExecutorProcess
 
     async def add_request(
         self,
@@ -245,11 +248,16 @@ class AsyncLLM(EngineClient):
             await self.abort(request_id)
             raise
 
-    def _process_request_outputs(self, request_outputs: List[RequestOutput]):
+    def _process_request_outputs(self, request_outputs: List[RequestOutput], observability: Optional[dict] = None):
         """Process outputs by putting them into per-request queues."""
+
+        now = time.time()
 
         for request_output in request_outputs:
             request_id = request_output.request_id
+            if observability is not None:
+                request_output.observability = observability
+                request_output.time = now
 
             # Note: it is possible a request was aborted and removed from
             # the state due to client cancellations, so if we encounter a
@@ -263,17 +271,18 @@ class AsyncLLM(EngineClient):
         try:
             while True:
                 # 1) Pull EngineCoreOutput from the EngineCore.
-                outputs = await self.engine_core.get_output_async()
+                EngineCoreOutput = await self.engine_core.get_output_async()
+                outputs, observability = EngineCoreOutput
 
                 # 2) Detokenize based on the output.
                 request_outputs, reqs_to_abort = self.detokenizer.step(outputs)
 
                 # 3) Put the RequestOutputs into the per-request queues.
-                self._process_request_outputs(request_outputs)
+                self._process_request_outputs(request_outputs, observability)
 
                 # 4) Abort any requests that finished due to stop strings.
                 await self.engine_core.abort_requests_async(reqs_to_abort)
-
+                    
         except BaseException as e:
             logger.error(e)
             raise e
@@ -290,6 +299,12 @@ class AsyncLLM(EngineClient):
         if request_id in self.rid_to_queue:
             del self.rid_to_queue[request_id]
 
+    async def get_stats(self) -> dict:
+        return await self.engine_core.get_stats_async()
+    
+    async def engine_get_time_record(self):
+        return await self.engine_core.get_time_record_async()
+    
     def encode(
         self,
         prompt: PromptType,

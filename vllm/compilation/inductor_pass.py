@@ -81,4 +81,5 @@ class CallableInductorPass(InductorPass):
         return self._uuid
 
     def __setstate__(self, state):
-        raise ValueError("Cannot unpickle CallableInductorPass")
+        # raise ValueError("Cannot unpickle CallableInductorPass")
+        pass

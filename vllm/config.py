@@ -275,6 +275,7 @@ class ModelConfig:
 
         hf_config = get_config(self.model, trust_remote_code, revision,
                                code_revision, config_format)
+        
 
         if hf_overrides_kw:
             logger.info("Overriding HF config with %s", hf_overrides_kw)
@@ -727,9 +728,13 @@ class ModelConfig:
 
         if self.is_attention_free:
             return 0
-
+        # (Debug250915) Reference: https://github.com/vllm-project/vllm/issues/18573
         if hasattr(self.hf_text_config, "head_dim"):
-            return self.hf_text_config.head_dim
+            if self.hf_text_config.head_dim:
+                return self.hf_text_config.head_dim
+            else: 
+                return (self.hf_text_config.hidden_size //
+                self.hf_text_config.num_attention_heads)
         # FIXME(woosuk): This may not be true for all models.
         return (self.hf_text_config.hidden_size //
                 self.hf_text_config.num_attention_heads)
@@ -977,6 +982,8 @@ class CacheConfig:
         sliding_window: Optional[int] = None,
         enable_prefix_caching: bool = False,
         cpu_offload_gb: float = 0,
+        swap_block_first: bool = True,
+        pin_memory_fix: bool = True,
     ) -> None:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
@@ -987,6 +994,9 @@ class CacheConfig:
         self.sliding_window = sliding_window
         self.enable_prefix_caching = enable_prefix_caching
         self.cpu_offload_gb = cpu_offload_gb
+        # SuperInfer KV-swap layout / pinning toggles.
+        self.swap_block_first = swap_block_first
+        self.pin_memory_fix = pin_memory_fix
 
         self._verify_args()
         self._verify_cache_dtype()
@@ -1323,7 +1333,7 @@ class ParallelConfig:
         from vllm.executor.executor_base import ExecutorBase
 
         if self.distributed_executor_backend not in (
-                "ray", "mp", None) and not (isinstance(
+                "ray", "mp", "independent-proc", None) and not (isinstance(
                     self.distributed_executor_backend, type) and issubclass(
                         self.distributed_executor_backend, ExecutorBase)):
             raise ValueError(
@@ -1402,6 +1412,14 @@ class SchedulerConfig:
 
     # The scheduling policy to use. "fcfs" (default) or "priority".
     policy: str = "fcfs"
+
+    # SuperInfer: number of blocks to keep proactively free as the swap-out
+    # budget. ``0`` disables proactive swapping (recomputation on eviction).
+    proactive_swap_budget: int = 0
+
+    # SuperInfer: enable the workaround for a prefix-caching invalidation bug
+    # (set via ``--no-prefix-cache-fix`` for ablation studies).
+    prefix_cache_fix: bool = True
 
     chunked_prefill_enabled: bool = field(init=False)
 
@@ -2475,6 +2493,38 @@ class ObservabilityConfig:
 
     # If set, collects the model execute time for the request.
     collect_model_execute_time: bool = False
+
+    # If set, collects the schedule time for the step.
+    collect_schedule_time: bool = False
+
+    # If set, collects the swap for the step.
+    collect_swap_time: bool = False
+
+    # If set, collects the reschedule time for the step.
+    collect_reschedule_time: bool = False
+
+    # If set, collects the update time after execution for the step.
+    collect_update_time: bool = False
+
+    # If set, collects the whole step time.
+    collect_step_time: bool = False
+
+    # If set, collects waiting time in async execution model.
+    collect_wait_execution_time: bool = False
+
+    # If set, collects waiting time in async swap model.
+    collect_wait_swap_time: bool = False
+
+    def need_collection(self) -> bool:
+        return self.collect_model_forward_time \
+            or self.collect_model_execute_time \
+            or self.collect_schedule_time \
+            or self.collect_swap_time \
+            or self.collect_reschedule_time \
+            or self.collect_update_time \
+            or self.collect_step_time \
+            or self.collect_wait_execution_time \
+            or self.collect_wait_swap_time
 
     def compute_hash(self) -> str:
         """

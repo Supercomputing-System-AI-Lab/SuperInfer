@@ -37,3 +37,10 @@ class ModelRunnerOutput:
     logprob_token_ids_cpu: Optional[torch.Tensor]
     # [num_reqs, max_num_logprobs + 1]
     logprobs_cpu: Optional[torch.Tensor]
+
+    # for observability
+    model_execute_time: Optional[float]
+    model_forward_time: Optional[float]
+
+    # NOTE(Mingtao): Need this to solve WTF Bug.
+    bad_ids: List[str]

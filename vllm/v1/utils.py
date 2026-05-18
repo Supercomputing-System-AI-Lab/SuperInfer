@@ -101,3 +101,26 @@ def make_zmq_socket(
 
     finally:
         ctx.destroy(linger=0)
+
+import time
+
+class TimeMeasurement:
+    def __init__(self, name: str, enable: bool = False):
+        self.name = name
+        self.start_time = None
+        self.end_time = None
+        self.elapsed_time = None
+        self.enable = enable
+
+    def __enter__(self):
+        if self.enable:
+            self.start_time = time.perf_counter()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.enable:
+            self.end_time = time.perf_counter()
+            self.elapsed_time = self.end_time - self.start_time
+
+    def print_if_enabled(self):
+        if self.enable:
+            print(f"{self.name}: {self.elapsed_time:.6f} s")

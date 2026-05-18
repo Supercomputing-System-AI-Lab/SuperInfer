@@ -1,4 +1,5 @@
 """KV-Cache Utilities."""
+import enum
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, NamedTuple, Optional, Tuple
@@ -8,6 +9,15 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
+class KVCacheBlockStatus(enum.IntEnum):
+    FREE = 0
+    FULL_CLEAN = 1
+    FULL_DIRTY = 2
+    FULL_SWAPPED = 3
+    HALF_CLEAN = 4
+    HALF_DIRTY = 5
+    HALF_SWAPPED = 6
+    EMPTY = 7
 
 class BlockHashType(NamedTuple):
     """Hash value of a block (int), the token IDs in the block, and extra keys.
@@ -38,11 +48,19 @@ class KVCacheBlock:
     prev_free_block: Optional["KVCacheBlock"] = None
     next_free_block: Optional["KVCacheBlock"] = None
 
+    status: KVCacheBlockStatus = KVCacheBlockStatus.FREE
+    mapped_cpu_block: Optional["KVCacheBlock"] = None  # None if in GPU
+
     def incr_ref(self):
         self.ref_cnt += 1
+        if self.mapped_cpu_block:
+            self.mapped_cpu_block.incr_ref()
 
-    def decr_ref(self):
+    # NOTE(julian): if decr_ref is called by swap_out, mapped_cpu_block should be kept alive
+    def decr_ref(self, keep_cpu: bool = False):
         self.ref_cnt -= 1
+        if self.mapped_cpu_block and (not keep_cpu):
+            self.mapped_cpu_block.decr_ref()
 
     @property
     def block_hash(self) -> Optional[BlockHashType]:
@@ -57,6 +75,78 @@ class KVCacheBlock:
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+
+    def is_clean(self) -> bool:
+        return (self.status == KVCacheBlockStatus.FULL_CLEAN
+                or self.status == KVCacheBlockStatus.HALF_CLEAN)
+
+    def is_dirty(self) -> bool:
+        return (self.status == KVCacheBlockStatus.FULL_DIRTY
+                or self.status == KVCacheBlockStatus.HALF_DIRTY)
+
+    def is_swapped(self) -> bool:
+        return (self.status == KVCacheBlockStatus.FULL_SWAPPED
+                or self.status == KVCacheBlockStatus.HALF_SWAPPED)
+
+    def is_full(self) -> bool:
+        return (self.status == KVCacheBlockStatus.FULL_CLEAN or
+                self.status == KVCacheBlockStatus.FULL_DIRTY or
+                self.status == KVCacheBlockStatus.FULL_SWAPPED)
+
+    def is_free(self) -> bool:
+        return self.status == KVCacheBlockStatus.FREE
+
+    def is_half(self) -> bool:
+        return (self.status == KVCacheBlockStatus.HALF_CLEAN or
+                self.status == KVCacheBlockStatus.HALF_DIRTY or
+                self.status == KVCacheBlockStatus.HALF_SWAPPED)
+
+    def is_used(self) -> bool:
+        return self.is_full() or self.is_half()
+
+    def mark_free(self):
+        self.status = KVCacheBlockStatus.FREE
+
+    def mark_empty(self):
+        self.status = KVCacheBlockStatus.EMPTY
+
+    def mark_clean(self):
+        if self.is_full():
+            self.status = KVCacheBlockStatus.FULL_CLEAN
+        elif self.is_half():
+            self.status = KVCacheBlockStatus.HALF_CLEAN
+        else:
+            raise ValueError(f"Invalid status {self.status}")
+
+    def mark_swapped(self):
+        if self.is_full():
+            self.status = KVCacheBlockStatus.FULL_SWAPPED
+        elif self.is_half():
+            self.status = KVCacheBlockStatus.HALF_SWAPPED
+        else:
+            raise ValueError(f"Invalid status {self.status}")
+
+    def mark_full(self, clean: bool = False, dirty: bool = False, swapped: bool = False):
+        assert clean + dirty + swapped == 1
+        if clean:
+            self.status = KVCacheBlockStatus.FULL_CLEAN
+        elif dirty:
+            self.status = KVCacheBlockStatus.FULL_DIRTY
+        elif swapped:
+            self.status = KVCacheBlockStatus.FULL_SWAPPED
+        else:
+            raise ValueError(f"Invalid status {self.status}")
+
+    def mark_half(self, clean: bool = False, dirty: bool = False, swapped: bool = False):
+        assert clean + dirty + swapped == 1
+        if clean:
+            self.status = KVCacheBlockStatus.HALF_CLEAN
+        elif dirty:
+            self.status = KVCacheBlockStatus.HALF_DIRTY
+        elif swapped:
+            self.status = KVCacheBlockStatus.HALF_SWAPPED
+        else:
+            raise ValueError(f"Invalid status {self.status}")
 
 
 class FreeKVCacheBlockQueue:

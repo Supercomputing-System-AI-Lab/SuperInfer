@@ -477,6 +477,7 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
     _CPU_OFFLOAD_MAX_BYTES = max_bytes
 
 
+# NOTE(jiahuan): maybe offload
 def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     device = next(module.parameters()).device
 

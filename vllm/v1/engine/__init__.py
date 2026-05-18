@@ -68,12 +68,19 @@ class EngineCoreOutputs(
 
     # [num_reqs]
     outputs: List[EngineCoreOutput]
-
+    observability: Optional[dict]
 
 @dataclass
 class EngineCoreProfile:
     is_start: bool
 
+@dataclass
+class EngineCoreStats:
+    pass
+
+@dataclass
+class EngineCoreTimeRecord:
+    pass
 
 class EngineCoreRequestType(enum.Enum):
     """
@@ -83,6 +90,8 @@ class EngineCoreRequestType(enum.Enum):
     ADD = b'\x00'
     ABORT = b'\x01'
     PROFILE = b'\x02'
+    STATS = b'\x03'
+    TIME_RECORD = b'\x03'
 
 
-EngineCoreRequestUnion = Union[EngineCoreRequest, EngineCoreProfile, List[str]]
+EngineCoreRequestUnion = Union[EngineCoreRequest, EngineCoreProfile, EngineCoreStats, EngineCoreTimeRecord, List[str]]

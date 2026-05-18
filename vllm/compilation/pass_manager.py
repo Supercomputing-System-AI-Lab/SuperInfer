@@ -74,4 +74,5 @@ class PostGradPassManager:
         Do not allow unpickling of the pass manager.
         If this is needed in the future, it should properly pickle the passes.
         """
-        raise ValueError("Cannot unpickle PostGradPassManager")
+        # raise ValueError("Cannot unpickle PostGradPassManager")
+        pass

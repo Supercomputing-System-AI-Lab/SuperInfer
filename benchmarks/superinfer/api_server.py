@@ -1,16 +1,16 @@
-"""
-NOTE: This API server is used only for demonstrating usage of AsyncEngine
-and simple performance benchmarks. It is not intended for production use.
-For production use, we recommend using our OpenAI compatible server.
-We are also not going to accept PRs modifying this file, please
-change `vllm/entrypoints/openai/api_server.py` instead.
+"""SuperInfer benchmark API server.
+
+Forked from ``vllm/entrypoints/api_server.py`` to expose ``/stats`` and
+per-token observability metadata used by the SuperInfer benchmark client.
+Not intended for production use.
 """
 import asyncio
-import json
 import ssl
+import time
 from argparse import Namespace
 from typing import Any, AsyncGenerator, Optional
 
+import orjson
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -31,10 +31,17 @@ app = FastAPI()
 engine = None
 
 
+
 @app.get("/health")
 async def health() -> Response:
     """Health check."""
     return Response(status_code=200)
+
+
+@app.get("/stats")
+async def stats() -> Response:
+    """Number of running/waiting/swapped, and CPU/GPU KV caches usage."""
+    return JSONResponse(await engine.get_stats())
 
 
 @app.post("/generate")
@@ -47,6 +54,7 @@ async def generate(request: Request) -> Response:
     - other fields: the sampling parameters (See `SamplingParams` for details).
     """
     request_dict = await request.json()
+    request_dict.pop("debug_id", None)
     return await _generate(request_dict, raw_request=request)
 
 
@@ -64,18 +72,24 @@ async def _generate(request_dict: dict, raw_request: Request) -> Response:
     async def stream_results() -> AsyncGenerator[bytes, None]:
         async for request_output in results_generator:
             prompt = request_output.prompt
+            
             assert prompt is not None
             text_outputs = [
                 prompt + output.text for output in request_output.outputs
             ]
             ret = {"text": text_outputs}
+            if request_output.time is None:
+                ret["time"] = time.time()
+            else:
+                ret["time"] = request_output.time
             if request_output.observability is not None:
                 ret["observability"] = request_output.observability
-            yield (json.dumps(ret) + "\n").encode("utf-8")
-
+            else:
+                ret["observability"] = None
+            # yield (json.dumps(ret) + "\0").encode("utf-8")
+            yield orjson.dumps(ret) + b"\0"
     if stream:
         return StreamingResponse(stream_results())
-
     # Non-streaming case
     final_output = None
     try:
@@ -87,8 +101,10 @@ async def _generate(request_dict: dict, raw_request: Request) -> Response:
     assert final_output is not None
     prompt = final_output.prompt
     assert prompt is not None
-    text_outputs = [prompt + output.text for output in final_output.outputs]
-    ret = {"text": text_outputs}
+    
+    ret = {}
+    # text_outputs = [prompt + output.text for output in final_output.outputs]
+    # ret = {"text": text_outputs}
     return JSONResponse(ret)
 
 
@@ -136,6 +152,8 @@ async def run_server(args: Namespace,
         ssl_certfile=args.ssl_certfile,
         ssl_ca_certs=args.ssl_ca_certs,
         ssl_cert_reqs=args.ssl_cert_reqs,
+        limit_concurrency=1638400,
+        backlog=1000000,
         **uvicorn_kwargs,
     )
 
@@ -166,5 +184,4 @@ if __name__ == "__main__":
     parser.add_argument("--log-level", type=str, default="debug")
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
-
     asyncio.run(run_server(args))

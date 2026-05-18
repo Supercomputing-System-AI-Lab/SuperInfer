@@ -167,9 +167,10 @@ class Worker:
                                                  self.parallel_config)
         num_gpu_blocks = int(available_kv_cache_memory // cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
-        return num_gpu_blocks, 0
+        num_cpu_blocks = int(self.vllm_config.cache_config.swap_space_bytes) // cache_block_size
+        return num_gpu_blocks, num_cpu_blocks
 
-    def initialize_cache(self, num_gpu_blocks: int) -> None:
+    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int = 0) -> None:
         """Allocate GPU and CPU KV cache with the specified number of blocks."""
         if num_gpu_blocks <= 0:
             raise ValueError("No available memory for the cache blocks. "
@@ -186,7 +187,7 @@ class Worker:
                 "`gpu_memory_utilization` or decreasing `max_model_len` when "
                 "initializing the engine.")
 
-        self.model_runner.initialize_kv_cache(num_gpu_blocks)
+        self.model_runner.initialize_kv_cache(num_gpu_blocks, num_cpu_blocks)
 
     def compile_or_warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
@@ -261,7 +262,6 @@ def _get_cache_block_size(
     num_heads = model_config.get_num_kv_heads(parallel_config)
     num_attention_layers = model_config.get_num_layers_by_block_type(
         parallel_config, LayerBlockType.attention)
-
     key_cache_block = cache_config.block_size * num_heads * head_size
     value_cache_block = key_cache_block
     total = num_attention_layers * (key_cache_block + value_cache_block)

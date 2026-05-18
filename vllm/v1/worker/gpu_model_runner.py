@@ -1,8 +1,10 @@
 import gc
+import pickle
 import time
 from typing import TYPE_CHECKING, Dict, List, Tuple, cast
 
 import numpy as np
+import nvtx
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -64,6 +66,7 @@ class GPUModelRunner:
         self.is_multimodal_model = model_config.is_multimodal_model
         self.sliding_window = model_config.get_sliding_window()
         self.block_size = cache_config.block_size
+        print("Size for each block: " + str(self.block_size) + "MB")
         self.max_model_len = model_config.max_model_len
         self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
@@ -93,6 +96,7 @@ class GPUModelRunner:
         # Lazy initialization
         # self.model: nn.Module  # Set after load_model
         self.kv_caches: List[torch.Tensor] = []
+        # self.kv_caches_cpu: List[torch.Tensor] = []
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: Dict[str, Dict[int, torch.Tensor]] = {}
 
@@ -161,6 +165,8 @@ class GPUModelRunner:
                                              device="cpu",
                                              pin_memory=self.pin_memory)
         self.seq_start_loc_np = self.seq_start_loc_cpu.numpy()
+
+        self.execution_stream = torch.cuda.Stream(device=self.device)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
@@ -465,11 +471,23 @@ class GPUModelRunner:
                 encoder_outputs.append(encoder_output[start_idx:end_idx])
         return encoder_outputs
 
+    @nvtx.annotate("GPUModelRunner.execute_model", color="green")
     @torch.inference_mode()
+    # def execute_model_default(
     def execute_model(
+            self,
+            scheduler_output: "SchedulerOutput",
+    ) -> ModelRunnerOutput:
+        with torch.cuda.stream(self.execution_stream):
+            return self.execute_model_default_stream(scheduler_output)
+
+    # @torch.inference_mode()
+    def execute_model_default_stream(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
+        # NOTE(Mingtao): Need this to solve WTF Bug.
+        bad_ids = []
         self._update_states(scheduler_output)
 
         if self.is_multimodal_model:
@@ -515,8 +533,17 @@ class GPUModelRunner:
             input_ids = self.input_ids[:num_input_tokens]
             inputs_embeds = None
 
+        # sync with H2D swap stream
+
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
+        # time.sleep(0.03)
+        if self.observability_config.collect_model_forward_time:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+        
+        start_t = time.time()
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = self.model(
                 input_ids=input_ids,
@@ -525,6 +552,17 @@ class GPUModelRunner:
                 attn_metadata=None,
                 inputs_embeds=inputs_embeds,
             )
+        end_t1 = time.time()
+        if self.observability_config.collect_model_forward_time:
+            end.record()
+            end.synchronize()  # NOTE(jiahaun): why time consuming?
+            model_forward_time = start.elapsed_time(end) / 1000
+        # if self.observability_config.collect_model_forward_time:
+        #     model_forward_time = 0
+        end_t2 = time.time()
+        # print('Test1: ', (end_t1 - start_t) * 1000)
+        # print('Test2: ', (end_t2 - start_t) * 1000)
+        # print('Test3: ', model_forward_time * 1000)
         hidden_states = hidden_states[:num_scheduled_tokens]
         hidden_states = hidden_states[logits_indices]
         logits = self.model.compute_logits(hidden_states, None)
@@ -545,6 +583,11 @@ class GPUModelRunner:
             req_state = self.requests[req_id]
             seq_len = (req_state.num_computed_tokens +
                        scheduler_output.num_scheduled_tokens[req_id])
+            if seq_len > req_state.num_tokens:
+                print(f"seq_len: {seq_len}, num_tokens: {req_state.num_tokens}, req_id: {req_id}")  # noqa: E501
+                print(f"output-3: {req_state.output_token_ids[-3:]} ")
+                print("WTF")
+
             assert seq_len <= req_state.num_tokens
             if seq_len == req_state.num_tokens:
                 # Append the sampled token to the output token ids.
@@ -552,6 +595,7 @@ class GPUModelRunner:
                 self.input_batch.token_ids_cpu[i, seq_len] = token_id
                 req_state.output_token_ids.append(token_id)
             else:
+                bad_ids.append(req_id)
                 # Ignore the sampled token from the partial request.
                 # Rewind the generator state as if the token was not sampled.
                 generator = self.input_batch.generators.get(i)
@@ -562,11 +606,11 @@ class GPUModelRunner:
         if sampler_output.logprob_token_ids is None:
             logprob_token_ids = None
         else:
-            logprob_token_ids = sampler_output.logprob_token_ids.cpu()
+            logprob_token_ids = sampler_output.logprob_token_ids.cpu().share_memory_()
         if sampler_output.logprobs is None:
             logprobs = None
         else:
-            logprobs = sampler_output.logprobs.cpu()
+            logprobs = sampler_output.logprobs.cpu().share_memory_()
 
         # num_reqs entries should be non-None
         assert all(
@@ -580,9 +624,13 @@ class GPUModelRunner:
             sampled_token_ids=sampled_token_ids,
             logprob_token_ids_cpu=logprob_token_ids,
             logprobs_cpu=logprobs,
+            model_execute_time=None,
+            model_forward_time=model_forward_time if self.observability_config.collect_model_forward_time else None,
+            bad_ids=bad_ids
         )
         return model_runner_output
 
+    
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
@@ -743,12 +791,45 @@ class GPUModelRunner:
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / (1 << 30))
 
-    def initialize_kv_cache(self, num_blocks: int) -> None:
+
+    def initialize_kv_cache(self, num_gpu_blocks: int,
+                            num_cpu_blocks: int = 0) -> None:
         assert len(self.kv_caches) == 0
-        kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
-            num_blocks, self.block_size, self.num_kv_heads, self.head_size)
-        for _ in range(self.num_attn_layers):
-            self.kv_caches.append(
-                torch.zeros(kv_cache_shape,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device))
+        kv_cache_shape_gpu = FlashAttentionBackend.get_kv_cache_shape(
+            num_gpu_blocks, self.block_size, self.num_kv_heads,
+            self.head_size)
+
+        logger.info("Initializing GPU KV caches...")
+
+        # SuperInfer's multi-threaded swap kernel performs much better when
+        # the leading axis is the block index (so each worker thread copies
+        # a contiguous block per layer); the original vLLM layout puts
+        # layer first.
+        block_first = self.cache_config.swap_block_first
+        if block_first:
+            shape = ((kv_cache_shape_gpu[1], self.num_attn_layers,
+                      kv_cache_shape_gpu[0]) + kv_cache_shape_gpu[2:])
+        else:
+            shape = (self.num_attn_layers, ) + kv_cache_shape_gpu
+
+        self.kv_caches_gpu_tensor = torch.zeros(
+            shape,
+            dtype=self.kv_cache_dtype,
+            device=self.device,
+        ).share_memory_()
+
+        assert self.kv_caches_gpu_tensor.is_shared()
+        logger.info("GPU KV caches are initialized")
+        if block_first:
+            self.kv_caches = [
+                self.kv_caches_gpu_tensor[:, i]
+                for i in range(self.num_attn_layers)
+            ]
+        else:
+            self.kv_caches = [
+                self.kv_caches_gpu_tensor[i]
+                for i in range(self.num_attn_layers)
+            ]
+        # Wait for the executor's spawn-pickled tensor to settle. Without
+        # this, downstream consumers occasionally observe a torn handle.
+        time.sleep(5)

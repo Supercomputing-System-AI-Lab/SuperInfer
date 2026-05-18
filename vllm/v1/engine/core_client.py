@@ -1,6 +1,6 @@
 import os
 import weakref
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import msgspec
 import zmq
@@ -10,7 +10,8 @@ from vllm.logger import init_logger
 from vllm.utils import get_open_zmq_ipc_path, kill_process_tree
 from vllm.v1.engine import (EngineCoreOutput, EngineCoreOutputs,
                             EngineCoreProfile, EngineCoreRequest,
-                            EngineCoreRequestType, EngineCoreRequestUnion)
+                            EngineCoreRequestType, EngineCoreRequestUnion,
+                            EngineCoreStats, EngineCoreTimeRecord)
 from vllm.v1.engine.core import (EngineCore, EngineCoreProc,
                                  EngineCoreProcHandle)
 from vllm.v1.serial_utils import PickleEncoder
@@ -54,7 +55,7 @@ class EngineCoreClient:
     def shutdown(self):
         pass
 
-    def get_output(self) -> List[EngineCoreOutput]:
+    def get_output(self) -> Tuple[List[EngineCoreOutput], dict]:
         raise NotImplementedError
 
     def add_request(self, request: EngineCoreRequest) -> None:
@@ -66,7 +67,10 @@ class EngineCoreClient:
     def abort_requests(self, request_ids: List[str]) -> None:
         raise NotImplementedError
 
-    async def get_output_async(self) -> List[EngineCoreOutput]:
+    def get_stats(self) -> dict:
+        raise NotImplementedError
+
+    async def get_output_async(self) -> Tuple[List[EngineCoreOutput], dict]:
         raise NotImplementedError
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
@@ -76,6 +80,9 @@ class EngineCoreClient:
         raise NotImplementedError
 
     async def abort_requests_async(self, request_ids: List[str]) -> None:
+        raise NotImplementedError
+
+    async def get_stats_async(self) -> dict:
         raise NotImplementedError
 
 
@@ -135,6 +142,8 @@ class MPClient(EngineCoreClient):
         # Serialization setup.
         self.encoder = PickleEncoder()
         self.decoder = msgspec.msgpack.Decoder(EngineCoreOutputs)
+        self.decoder_stats = msgspec.msgpack.Decoder(dict)
+        self.decoder_tr = msgspec.msgpack.Decoder(dict)
 
         # ZMQ setup.
         if asyncio_mode:
@@ -146,6 +155,7 @@ class MPClient(EngineCoreClient):
         ready_path = get_open_zmq_ipc_path()
         output_path = get_open_zmq_ipc_path()
         input_path = get_open_zmq_ipc_path()
+        output_stats_path = get_open_zmq_ipc_path()
 
         # Get output (EngineCoreOutput) from EngineCore.
         self.output_socket = self.ctx.socket(zmq.constants.PULL)
@@ -155,6 +165,9 @@ class MPClient(EngineCoreClient):
         self.input_socket = self.ctx.socket(zmq.constants.PUSH)
         self.input_socket.bind(input_path)
 
+        self.output_stats_socket = self.ctx.socket(zmq.constants.PULL)
+        self.output_stats_socket.connect(output_stats_path)
+
         # Start EngineCore in background process.
         self.proc_handle: Optional[EngineCoreProcHandle]
         self.proc_handle = EngineCoreProc.make_engine_core_process(
@@ -163,6 +176,7 @@ class MPClient(EngineCoreClient):
             input_path,  # type: ignore[misc]  # MyPy incorrectly flags duplicate keywords
             output_path=output_path,  # type: ignore[misc]
             ready_path=ready_path,  # type: ignore[misc]
+            output_stats_path=output_stats_path,  # type: ignore[misc]
             **kwargs,
         )
         self._finalizer = weakref.finalize(self, self.shutdown)
@@ -198,11 +212,14 @@ class SyncMPClient(MPClient):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, asyncio_mode=False, **kwargs)
 
-    def get_output(self) -> List[EngineCoreOutput]:
+    def get_output(self) -> Tuple[List[EngineCoreOutput], dict]:
 
         (frame, ) = self.output_socket.recv_multipart(copy=False)
-        engine_core_outputs = self.decoder.decode(frame.buffer).outputs
-        return engine_core_outputs
+        # outputs = self.decoder.decode(frames[0].buffer)
+        outputs = self.decoder.decode(frame.buffer)
+        engine_core_outputs = outputs.outputs
+        observability = outputs.observability
+        return engine_core_outputs, observability
 
     def _send_input(self, request_type: EngineCoreRequestType,
                     request: EngineCoreRequestUnion) -> None:
@@ -228,12 +245,13 @@ class AsyncMPClient(MPClient):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, asyncio_mode=True, **kwargs)
 
-    async def get_output_async(self) -> List[EngineCoreOutput]:
+    async def get_output_async(self) -> Tuple[List[EngineCoreOutput], dict]:
 
         frames = await self.output_socket.recv_multipart(copy=False)
-        engine_core_outputs = self.decoder.decode(frames[0].buffer).outputs
-
-        return engine_core_outputs
+        outputs = self.decoder.decode(frames[0].buffer)
+        engine_core_outputs = outputs.outputs
+        observability = outputs.observability
+        return engine_core_outputs, observability
 
     async def _send_input(self, request_type: EngineCoreRequestType,
                           request: EngineCoreRequestUnion) -> None:
@@ -251,3 +269,15 @@ class AsyncMPClient(MPClient):
     async def profile_async(self, is_start: bool = True) -> None:
         await self._send_input(EngineCoreRequestType.PROFILE,
                                EngineCoreProfile(is_start))
+
+    async def get_stats_async(self) -> None:
+        await self._send_input(EngineCoreRequestType.STATS, EngineCoreStats())
+        frames = await self.output_stats_socket.recv_multipart(copy=False)
+        stats = self.decoder_stats.decode(frames[0].buffer)
+        return stats
+    
+    async def get_time_record_async(self) -> None:
+        await self._send_input(EngineCoreRequestType.TIME_RECORD, EngineCoreTimeRecord())
+        frames = await self.output_stats_socket.recv_multipart(copy=False)
+        stats = self.decoder_tr.decode(frames[0].buffer)
+        return stats

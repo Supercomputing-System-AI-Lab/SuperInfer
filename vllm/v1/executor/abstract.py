@@ -13,7 +13,7 @@ class Executor(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def initialize(self, num_gpu_blocks: int) -> None:
+    def initialize(self, num_gpu_blocks: int, num_cpu_blocks: int = 0) -> None:
         raise NotImplementedError
 
     @abstractmethod

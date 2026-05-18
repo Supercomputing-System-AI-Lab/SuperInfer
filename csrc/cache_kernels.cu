@@ -62,6 +62,111 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
   }
 }
 
+// aggregate all layers by cudaMemcpy2DAsync
+void swap_blocks_new(torch::Tensor& kv_caches_gpu, torch::Tensor& kv_caches_cpu,
+                    const torch::Tensor& blocks_to_swap_in, const torch::Tensor& blocks_to_swap_out) {
+  TORCH_CHECK(kv_caches_gpu.device().is_cuda(), "kv_caches_gpu must be on GPU");
+  TORCH_CHECK(kv_caches_cpu.device().is_cpu(), "kv_caches_cpu must be on CPU");
+  TORCH_CHECK(blocks_to_swap_in.device().is_cpu(), "blocks_to_swap_in must be on CPU");
+  TORCH_CHECK(blocks_to_swap_out.device().is_cpu(), "blocks_to_swap_out must be on CPU");
+  TORCH_CHECK(blocks_to_swap_in.dim() == 2, "blocks_to_swap_in must be 2D");
+  TORCH_CHECK(blocks_to_swap_out.dim() == 2, "blocks_to_swap_out must be 2D");
+  TORCH_CHECK(blocks_to_swap_in.size(1) == 2, "blocks_to_swap_in must have 2 columns");
+  TORCH_CHECK(blocks_to_swap_out.size(1) == 2, "blocks_to_swap_out must have 2 columns");
+  TORCH_CHECK(blocks_to_swap_in.dtype() == torch::kInt64, "blocks_to_swap_in must be int64");
+  TORCH_CHECK(blocks_to_swap_out.dtype() == torch::kInt64, "blocks_to_swap_out must be int64");
+
+  const auto cpu_device = kv_caches_cpu.device();
+  const auto gpu_device = kv_caches_gpu.device();
+  const at::cuda::OptionalCUDAGuard device_guard(gpu_device);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  char* kv_caches_gpu_ptr = static_cast<char*>(kv_caches_gpu.data_ptr());
+  char* kv_caches_cpu_ptr = static_cast<char*>(kv_caches_cpu.data_ptr());
+
+  const size_t num_layers = kv_caches_gpu.size(0);
+  const size_t num_blocks_to_swap_in = blocks_to_swap_in.size(0);
+  const size_t num_blocks_to_swap_out = blocks_to_swap_out.size(0);
+  const size_t block_size_in_bytes = kv_caches_gpu.element_size() * kv_caches_gpu[0][0].numel();
+  const size_t layer_size_in_bytes = kv_caches_gpu.element_size() * kv_caches_gpu[0].numel();
+
+  size_t d_pitch = layer_size_in_bytes;
+  size_t s_pitch = layer_size_in_bytes;
+  size_t width = block_size_in_bytes;
+  size_t height = num_layers;
+
+  for (size_t i = 0; i < num_blocks_to_swap_in; i++) {
+    void *src = kv_caches_cpu_ptr + blocks_to_swap_in[i][0].item<int64_t>() * block_size_in_bytes;
+    void *dst = kv_caches_gpu_ptr + blocks_to_swap_in[i][1].item<int64_t>() * block_size_in_bytes;
+    cudaMemcpy2DAsync(dst, d_pitch, src, s_pitch, width, height, cudaMemcpyHostToDevice, stream);
+  }
+  for (size_t i = 0; i < num_blocks_to_swap_out; i++) {
+    void *src = kv_caches_gpu_ptr + blocks_to_swap_out[i][0].item<int64_t>() * block_size_in_bytes;
+    void *dst = kv_caches_cpu_ptr + blocks_to_swap_out[i][1].item<int64_t>() * block_size_in_bytes;
+    cudaMemcpy2DAsync(dst, d_pitch, src, s_pitch, width, height, cudaMemcpyDeviceToHost, stream);
+  }
+  cudaStreamSynchronize(stream);
+}
+
+// void swap_blocks_new_new(torch::Tensor& kv_caches_gpu, torch::Tensor& kv_caches_cpu,
+//                      const torch::Tensor& blocks_to_swap_in, const torch::Tensor& blocks_to_swap_out) {
+//   TORCH_CHECK(kv_caches_gpu.device().is_cuda(), "kv_caches_gpu must be on GPU");
+//   TORCH_CHECK(kv_caches_cpu.device().is_cpu(), "kv_caches_cpu must be on CPU");
+//   TORCH_CHECK(blocks_to_swap_in.device().is_cpu(), "blocks_to_swap_in must be on CPU");
+//   TORCH_CHECK(blocks_to_swap_out.device().is_cpu(), "blocks_to_swap_out must be on CPU");
+
+//   const auto cpu_device = kv_caches_cpu.device();
+//   const auto gpu_device = kv_caches_gpu.device();
+//   const at::cuda::OptionalCUDAGuard device_guard(gpu_device);
+//   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+//   char* kv_caches_gpu_ptr = static_cast<char*>(kv_caches_gpu.data_ptr());
+//   char* kv_caches_cpu_ptr = static_cast<char*>(kv_caches_cpu.data_ptr());
+
+//   const size_t num_layers = kv_caches_gpu.size(0);
+//   const size_t num_blocks_to_swap_in = blocks_to_swap_in.size(0);
+//   const size_t num_blocks_to_swap_out = blocks_to_swap_out.size(0);
+//   const size_t block_size_in_bytes = kv_caches_gpu.element_size() * kv_caches_gpu[0][0].numel();
+//   const size_t layer_size_in_bytes = kv_caches_gpu.element_size() * kv_caches_gpu[0].numel();
+
+//   // kv_caches: num_layer, num_blocks, ...
+//   // blocks_to_swap_in/out: num_blocks, 2
+
+//   const size_t count = (num_blocks_to_swap_in + num_blocks_to_swap_out) * num_layers;
+//   std::vector<void*> srcs(count);
+//   std::vector<void*> dsts(count);
+//   const std::vector<size_t> sizes(count, block_size_in_bytes);
+
+//   const size_t numAttrs = 2;
+//   cudaMemcpyAttributes attr_in = ?
+//   cudaMemcpyAttributes attr_out = ?
+//   const std::vector<cudaMemcpyAttributes> attrs = {attr_in, attr_out};
+//   const std::vector<size_t> attrsIdxs = {0, num_blocks_to_swap_in * num_layers};
+
+//   std::vector<size_t> failIdx(count);
+
+//   for (size_t i = 0; i < num_blocks_to_swap_in; i++) {
+//     const int64_t src_block_number = blocks_to_swap_in[i][0].item<int64_t>();
+//     const int64_t dst_block_number = blocks_to_swap_in[i][1].item<int64_t>();
+//     for (size_t j = 0; j < num_layers; j++) {
+//       const size_t idx = i * num_layers + j;
+//       srcs[idx] = kv_caches_cpu_ptr + j * layer_size_in_bytes + src_block_number * block_size_in_bytes;
+//       dsts[idx] = kv_caches_gpu_ptr + j * layer_size_in_bytes + dst_block_number * block_size_in_bytes;
+//     }
+//   }
+//   for (size_t i = 0; i < num_blocks_to_swap_out; i++) {
+//     const int64_t src_block_number = blocks_to_swap_out[i][0].item<int64_t>();
+//     const int64_t dst_block_number = blocks_to_swap_out[i][1].item<int64_t>();
+//     for (size_t j = 0; j < num_layers; j++) {
+//       const size_t idx = num_blocks_to_swap_in * num_layers + i * num_layers + j;
+//       srcs[idx] = kv_caches_gpu_ptr + j * layer_size_in_bytes + src_block_number * block_size_in_bytes;
+//       dsts[idx] = kv_caches_cpu_ptr + j * layer_size_in_bytes + dst_block_number * block_size_in_bytes;
+//     }
+//   }
+
+//     (dsts.data(), srcs.data(), sizes.data(), count,
+//                        attrs.data(), attrsIdxs.data(), numAttrs, failIdx.data(), stream);
+// }
+
 namespace vllm {
 
 // Grid: (num_layers, num_pairs)

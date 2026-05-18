@@ -199,6 +199,12 @@ class EngineArgs:
 
     generation_config: Optional[str] = None
 
+    # SuperInfer KV-swap knobs.
+    proactive_swap_budget: int = 0
+    swapper_block_first: bool = True
+    pin_memory_fix: bool = True
+    prefix_cache_fix: bool = True
+
     def __post_init__(self):
         if not self.tokenizer:
             self.tokenizer = self.model
@@ -389,7 +395,7 @@ class EngineArgs:
         # Parallel arguments
         parser.add_argument(
             '--distributed-executor-backend',
-            choices=['ray', 'mp'],
+            choices=['ray', 'mp', 'independent-proc'],
             default=EngineArgs.distributed_executor_backend,
             help='Backend to use for distributed model '
             'workers, either "ray" or "mp" (multiprocessing). If the product '
@@ -442,6 +448,33 @@ class EngineArgs:
             help="Enables automatic prefix caching. "
             "Use --no-enable-prefix-caching to disable explicitly.",
         )
+
+        # SuperInfer KV-swap knobs.
+        parser.add_argument(
+            "--proactive-swap-budget",
+            type=int,
+            default=EngineArgs.proactive_swap_budget,
+            help="(SuperInfer) Number of GPU blocks to keep proactively "
+            "free as a swap-out budget. 0 disables proactive swapping.")
+        parser.add_argument(
+            "--swapper-block-first",
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.swapper_block_first,
+            help="(SuperInfer) Lay out the KV cache with the block index "
+            "as the leading axis (better for the multi-threaded swap "
+            "kernel).")
+        parser.add_argument(
+            "--pin-memory-fix",
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.pin_memory_fix,
+            help="(SuperInfer) Use cudaHostRegister for the CPU KV mirror "
+            "to work around torch's 256 GiB pin limit.")
+        parser.add_argument(
+            "--prefix-cache-fix",
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.prefix_cache_fix,
+            help="(SuperInfer) Apply the prefix-cache invalidation "
+            "workaround. Disable for ablation only.")
         parser.add_argument('--disable-sliding-window',
                             action='store_true',
                             help='Disables sliding window, '
@@ -1060,6 +1093,8 @@ class EngineArgs:
             sliding_window=model_config.get_sliding_window(),
             enable_prefix_caching=self.enable_prefix_caching,
             cpu_offload_gb=self.cpu_offload_gb,
+            swap_block_first=self.swapper_block_first,
+            pin_memory_fix=self.pin_memory_fix,
         )
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
@@ -1190,7 +1225,9 @@ class EngineArgs:
             multi_step_stream_outputs=self.multi_step_stream_outputs,
             send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER
                              and parallel_config.use_ray),
-            policy=self.scheduling_policy)
+            policy=self.scheduling_policy,
+            proactive_swap_budget=self.proactive_swap_budget,
+            prefix_cache_fix=self.prefix_cache_fix)
         lora_config = LoRAConfig(
             bias_enabled=self.enable_lora_bias,
             max_lora_rank=self.max_lora_rank,
@@ -1232,6 +1269,20 @@ class EngineArgs:
             collect_model_forward_time="model" in detailed_trace_modules
             or "all" in detailed_trace_modules,
             collect_model_execute_time="worker" in detailed_trace_modules
+            or "all" in detailed_trace_modules,
+            collect_schedule_time="schedule" in detailed_trace_modules
+            or "all" in detailed_trace_modules,
+            collect_reschedule_time="reschedule" in detailed_trace_modules
+            or "all" in detailed_trace_modules,
+            collect_step_time="step" in detailed_trace_modules
+            or "all" in detailed_trace_modules,
+            collect_update_time="update" in detailed_trace_modules
+            or "all" in detailed_trace_modules,
+            collect_wait_execution_time="wait_execution" in detailed_trace_modules
+            or "all" in detailed_trace_modules,
+            collect_wait_swap_time="wait_swap" in detailed_trace_modules
+            or "all" in detailed_trace_modules,
+            collect_swap_time="swap" in detailed_trace_modules
             or "all" in detailed_trace_modules,
         )
 

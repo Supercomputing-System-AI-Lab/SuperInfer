@@ -174,7 +174,7 @@ def get_config(
     if is_gguf:
         kwargs["gguf_file"] = Path(model).name
         model = Path(model).parent
-
+    
     if config_format == ConfigFormat.AUTO:
         if is_gguf or file_or_path_exists(
                 model, HF_CONFIG_NAME, revision=revision):
@@ -193,7 +193,7 @@ def get_config(
                         token=HF_TOKEN)
 
             raise ValueError(f"No supported config format found in {model}")
-
+    
     if config_format == ConfigFormat.HF:
         config_dict, _ = PretrainedConfig.get_config_dict(
             model,
@@ -202,9 +202,10 @@ def get_config(
             token=HF_TOKEN,
             **kwargs,
         )
-
+        
         # Use custom model class if it's in our registry
         model_type = config_dict.get("model_type")
+        
         if model_type in _CONFIG_REGISTRY:
             config_class = _CONFIG_REGISTRY[model_type]
             config = config_class.from_pretrained(
@@ -237,7 +238,6 @@ def get_config(
                     raise RuntimeError(err_msg) from e
                 else:
                     raise e
-
     elif config_format == ConfigFormat.MISTRAL:
         config = load_params_config(model, revision, token=HF_TOKEN, **kwargs)
     else:
@@ -255,7 +255,6 @@ def get_config(
 
     if trust_remote_code:
         maybe_register_config_serialize_by_value()
-
     return config
 
 
